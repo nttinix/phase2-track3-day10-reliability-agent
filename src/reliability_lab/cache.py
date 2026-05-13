@@ -42,9 +42,8 @@ class CacheEntry:
 
 
 class ResponseCache:
-    """Simple in-memory cache skeleton.
+    """Simple in-memory cache with TTL, similarity lookup, and safety guardrails.
 
-    TODO(student): Add a better semantic similarity function and false-hit guardrails.
     Use the module-level _is_uncacheable() and _looks_like_false_hit() helpers in your
     get() and set() methods.  For production, replace with SharedRedisCache.
     """
@@ -53,9 +52,14 @@ class ResponseCache:
         self.ttl_seconds = ttl_seconds
         self.similarity_threshold = similarity_threshold
         self._entries: list[CacheEntry] = []
+        self.false_hit_log: list[dict[str, object]] = []
 
     def get(self, query: str) -> tuple[str | None, float]:
+        if _is_uncacheable(query):
+            return None, 0.0
+
         best_value: str | None = None
+        best_key: str | None = None
         best_score = 0.0
         now = time.time()
         self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
@@ -64,24 +68,51 @@ class ResponseCache:
             if score > best_score:
                 best_score = score
                 best_value = entry.value
+                best_key = entry.key
+
+        if best_key is not None and _looks_like_false_hit(query, best_key):
+            self.false_hit_log.append(
+                {"query": query, "cached_query": best_key, "score": round(best_score, 4)}
+            )
+            return None, best_score
+
         if best_score >= self.similarity_threshold:
             return best_value, best_score
         return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
+        if _is_uncacheable(query):
+            return
         self._entries.append(CacheEntry(query, value, time.time(), metadata or {}))
 
     @staticmethod
     def similarity(a: str, b: str) -> float:
-        """Very small baseline similarity using token overlap.
-
-        TODO(student): Improve with embeddings or a deterministic vectorizer.
-        """
-        left = set(a.lower().split())
-        right = set(b.lower().split())
-        if not left or not right:
+        """Deterministic hybrid similarity with exact, token, and char n-gram signals."""
+        left_norm = " ".join(a.lower().split())
+        right_norm = " ".join(b.lower().split())
+        if not left_norm or not right_norm:
             return 0.0
-        return len(left & right) / len(left | right)
+        if left_norm == right_norm:
+            return 1.0
+
+        token_pattern = re.compile(r"[a-z0-9]+")
+        left_tokens = set(token_pattern.findall(left_norm))
+        right_tokens = set(token_pattern.findall(right_norm))
+        if not left_tokens or not right_tokens:
+            return 0.0
+
+        token_score = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+        def ngrams(text: str, n: int = 3) -> set[str]:
+            compact = re.sub(r"\s+", " ", text)
+            if len(compact) <= n:
+                return {compact}
+            return {compact[i : i + n] for i in range(len(compact) - n + 1)}
+
+        left_grams = ngrams(left_norm)
+        right_grams = ngrams(right_norm)
+        char_score = len(left_grams & right_grams) / len(left_grams | right_grams)
+        return (token_score * 0.7) + (char_score * 0.3)
 
 
 # ---------------------------------------------------------------------------
@@ -92,10 +123,7 @@ class ResponseCache:
 class SharedRedisCache:
     """Redis-backed shared cache for multi-instance deployments.
 
-    TODO(student): Implement the get() and set() methods using Redis commands
-    so that cache state is shared across multiple gateway instances.
-
-    Data model (suggested):
+    Data model:
         Key    = "{prefix}{query_hash}"   (Redis String namespace)
         Value  = Redis Hash with fields:  "query", "response"
         TTL    = Redis EXPIRE (automatic cleanup — no manual eviction)
@@ -134,30 +162,56 @@ class SharedRedisCache:
 
     def get(self, query: str) -> tuple[str | None, float]:
         """Look up a cached response from Redis.
-
-        TODO(student): Implement cache lookup.  Suggested steps:
-        1. Return (None, 0.0) if _is_uncacheable(query)
-        2. Build exact-match key: f"{self.prefix}{self._query_hash(query)}"
-        3. Try self._redis.hget(key, "response") — if found return (response, 1.0)
-        4. Otherwise self._redis.scan_iter(f"{self.prefix}*") to iterate all cached keys
-        5. For each key, HGET "query" field and compute
-           ResponseCache.similarity(query, cached_query)
-        6. Track best match that is >= self.similarity_threshold
-        7. Before returning a match, check _looks_like_false_hit(); if true,
-           append to self.false_hit_log and return (None, best_score)
         """
-        return None, 0.0
+        if _is_uncacheable(query):
+            return None, 0.0
+
+        try:
+            exact_key = f"{self.prefix}{self._query_hash(query)}"
+            exact_response = self._redis.hget(exact_key, "response")
+            if exact_response is not None:
+                return str(exact_response), 1.0
+
+            best_response: str | None = None
+            best_query: str | None = None
+            best_score = 0.0
+            for key in self._redis.scan_iter(f"{self.prefix}*"):
+                cached_query = self._redis.hget(key, "query")
+                cached_response = self._redis.hget(key, "response")
+                if cached_query is None or cached_response is None:
+                    continue
+                score = ResponseCache.similarity(query, str(cached_query))
+                if score > best_score:
+                    best_score = score
+                    best_query = str(cached_query)
+                    best_response = str(cached_response)
+
+            if best_query is not None and _looks_like_false_hit(query, best_query):
+                self.false_hit_log.append(
+                    {"query": query, "cached_query": best_query, "score": round(best_score, 4)}
+                )
+                return None, best_score
+
+            if best_response is not None and best_score >= self.similarity_threshold:
+                return best_response, best_score
+            return None, best_score
+        except Exception:
+            return None, 0.0
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in Redis with TTL.
-
-        TODO(student): Implement cache storage.  Suggested steps:
-        1. Return immediately if _is_uncacheable(query)
-        2. Build key: f"{self.prefix}{self._query_hash(query)}"
-        3. self._redis.hset(key, mapping={"query": query, "response": value})
-        4. self._redis.expire(key, self.ttl_seconds)
         """
-        pass
+        if _is_uncacheable(query):
+            return
+        mapping = {"query": query, "response": value}
+        if metadata:
+            mapping.update({f"metadata:{key}": val for key, val in metadata.items()})
+        try:
+            key = f"{self.prefix}{self._query_hash(query)}"
+            self._redis.hset(key, mapping=mapping)
+            self._redis.expire(key, self.ttl_seconds)
+        except Exception:
+            return
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""

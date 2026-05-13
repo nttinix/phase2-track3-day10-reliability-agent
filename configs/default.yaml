@@ -9,7 +9,7 @@ providers:
     cost_per_1k_tokens: 0.006
 circuit_breaker:
   failure_threshold: 3
-  reset_timeout_seconds: 2
+  reset_timeout_seconds: 1
   success_threshold: 1
 cache:
   enabled: true
@@ -21,16 +21,24 @@ load_test:
   requests: 100
 
 # Chaos scenarios: each overrides provider fail_rate for targeted testing.
-# TODO(student): Add more scenarios or tweak these.
 scenarios:
   - name: primary_timeout_100
     description: "Primary provider fails 100% — all traffic should fallback"
     provider_overrides:
       primary: 1.0
+      backup: 0.0
   - name: primary_flaky_50
     description: "Primary provider fails 50% — circuit should oscillate"
     provider_overrides:
       primary: 0.5
+      backup: 0.0
   - name: all_healthy
     description: "Baseline — both providers healthy"
-    provider_overrides: {}
+    provider_overrides:
+      primary: 0.0
+      backup: 0.0
+  - name: cache_stale_candidate
+    description: "Similar policy queries with different years should not false-hit cache"
+    provider_overrides:
+      primary: 0.0
+      backup: 0.0
